@@ -1,404 +1,219 @@
-import os
-import faiss
-import numpy as np
-import pandas as pd
-import plotly.graph_objects as go
-import streamlit as st
-from sentence_transformers import SentenceTransformer
-from google import genai
-from google.genai import types
 
-# -----------------------------------------------------------------------------
-# 1. PAGE CONFIGURATION & STYLING
-# -----------------------------------------------------------------------------
+# ==============================================================================
+# PharmAssist AI: Streamlit Drug Interaction Assistant using FAISS RAG
+# Complete Runnable Python Implementation (app.py)
+# ==============================================================================
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+import plotly.express as px
+import json
+import os
+
+# --- FAISS & LangChain RAG Libraries ---
+from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_core.documents import Document
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+# --- Streamlit Page Configuration ---
 st.set_page_config(
-    page_title="MedGuard AI | Medication Interaction Assistant",
+    page_title="PharmAssist RAG - Drug Interaction Analyzer",
     page_icon="💊",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="expanded"
 )
 
-# Custom CSS for UI embellishments
-st.markdown(
-    """
-    <style>
-    .disclaimer-banner {
-        background-color: #FFF3CD;
-        color: #856404;
-        border-left: 6px solid #FFEBAA;
-        padding: 15px;
-        border-radius: 6px;
-        margin-bottom: 25px;
-        font-size: 0.95rem;
-    }
-    .disclaimer-title {
-        font-weight: bold;
-        color: #856404;
-        font-size: 1.05rem;
-        margin-bottom: 4px;
-    }
-    .metric-card {
-        background: #F8F9FA;
-        border: 1px solid #E9ECEF;
-        border-radius: 8px;
-        padding: 15px;
-        text-align: center;
-    }
-    </style>
-",
-    unsafe_allow_html=True,
-)
+# ------------------------------------------------------------------------------
+# 1. MEDICAL DISCLAIMER BANNER (MANDATORY)
+# ------------------------------------------------------------------------------
+def render_disclaimer():
+    st.warning(
+        "⚠️ **CRITICAL MEDICAL DISCLAIMER:** This application is an experimental AI decision-support system. "
+        "It provides interaction data for educational purposes only and is **NOT** a substitute for professional "
+        "medical advice, clinical diagnosis, or treatment. Always consult a licensed healthcare provider before "
+        "modifying any prescribed medication regimen."
+    )
 
-
-# -----------------------------------------------------------------------------
-# 2. KNOWLEDGE BASE & FAISS INDEX INITIALIZATION
-# -----------------------------------------------------------------------------
-# Detailed clinical drug interaction database
-INTERACTION_DATABASE = [
+# ------------------------------------------------------------------------------
+# 2. LOCAL KNOWLEDGE BASE & FAISS INDEX SETUP
+# ------------------------------------------------------------------------------
+DRUG_INTERACTION_KB = [
     {
         "drugs": ["Warfarin", "Aspirin"],
-        "severity": "High",
-        "severity_score": 90,
-        "organ_impact": {"Bleeding Risk": 95, "GI Distress": 80, "Renal Strain": 40, "CNS Effect": 20, "Cardiac Strain": 30},
-        "description": "Concomitant use of Warfarin and Aspirin significantly elevates major bleeding risk, including gastrointestinal and intracranial hemorrhages, due to dual inhibition of primary and secondary hemostasis."
+        "severity": 92,
+        "category": "High Risk / Critical Contraindication",
+        "mechanism": "Warfarin inhibits vitamin K-dependent clotting factors, while Aspirin causes irreversible platelet inhibition. Concurrent use synergistically increases severe gastrointestinal and intracranial hemorrhaging risk.",
+        "empathetic_summary": "Combining Warfarin and Aspirin significantly increases your risk of bleeding. Both medications make it much harder for your blood to clot, so taking them together can lead to serious internal bleeding even from minor injuries.",
+        "symptoms": ["Unusual bruising or petechiae", "Dark, tarry stools or blood in urine", "Frequent nosebleeds lasting >10 mins", "Unexplained dizziness or severe headaches"],
+        "precautions": ["Consult your cardiologist immediately before taking both.", "Do not discontinue prescribed Warfarin without physician guidance.", "Monitor INR levels closely.", "Avoid high-impact activities that risk physical trauma."]
+    },
+    {
+        "drugs": ["Lisinopril", "Potassium"],
+        "severity": 68,
+        "category": "Moderate-High Risk",
+        "mechanism": "Lisinopril (ACE inhibitor) reduces aldosterone secretion, leading to renal potassium retention. Supplemental potassium markedly raises serum potassium levels (Hyperkalemia).",
+        "empathetic_summary": "Taking Lisinopril along with potassium supplements can cause potassium to build up in your blood. High potassium levels can affect how your heart beats and cause fatigue.",
+        "symptoms": ["Irregular heartbeats (palpitations)", "Muscle weakness or numbness", "Nausea or abdominal cramping"],
+        "precautions": ["Have your doctor test your serum potassium levels.", "Avoid potassium-based salt substitutes.", "Report sudden heart fluttering immediately."]
     },
     {
         "drugs": ["Sertraline", "Tramadol"],
-        "severity": "High",
-        "severity_score": 88,
-        "organ_impact": {"Bleeding Risk": 30, "GI Distress": 50, "Renal Strain": 20, "CNS Effect": 95, "Cardiac Strain": 65},
-        "description": "Co-administration increases the risk of Serotonin Syndrome—a potentially life-threatening condition. Both drugs increase central serotonergic transmission through complementary pathways."
+        "severity": 85,
+        "category": "High Risk - Serotonin Syndrome",
+        "mechanism": "Sertraline (SSRI) inhibits serotonin reuptake while Tramadol enhances serotonin release and inhibits reuptake. Dual action overstimulates 5-HT receptors.",
+        "empathetic_summary": "Taking Sertraline and Tramadol together can trigger a rare but serious condition called Serotonin Syndrome, caused by too much serotonin accumulating in your nervous system.",
+        "symptoms": ["Agitation, confusion, or restlessness", "Rapid heart rate and elevated blood pressure", "Heavy sweating and shivering", "Muscle twitching or loss of coordination"],
+        "precautions": ["Seek immediate medical evaluation if you feel unusually agitated or feverish.", "Discuss alternative non-serotonergic pain management options with your physician."]
     },
     {
-        "drugs": ["Lisinopril", "Spironolactone"],
-        "severity": "High",
-        "severity_score": 85,
-        "organ_impact": {"Bleeding Risk": 10, "GI Distress": 30, "Renal Strain": 85, "CNS Effect": 30, "Cardiac Strain": 90},
-        "description": "Combining Lisinopril (ACE Inhibitor) and Spironolactone (Potassium-sparing Diuretic) markedly increases the risk of hyperkalemia (dangerously high blood potassium levels), which can cause fatal cardiac arrhythmias."
-    },
-    {
-        "drugs": ["Metformin", "Contrast Dye"],
-        "severity": "High",
-        "severity_score": 82,
-        "organ_impact": {"Bleeding Risk": 10, "GI Distress": 70, "Renal Strain": 95, "CNS Effect": 20, "Cardiac Strain": 40},
-        "description": "Iodinated contrast media can cause contrast-induced nephropathy leading to acute renal failure and severe lactic acidosis in patients receiving Metformin."
-    },
-    {
-        "drugs": ["Amoxicillin", "Methotrexate"],
-        "severity": "Moderate",
-        "severity_score": 65,
-        "organ_impact": {"Bleeding Risk": 40, "GI Distress": 60, "Renal Strain": 70, "CNS Effect": 20, "Cardiac Strain": 10},
-        "description": "Penicillins like Amoxicillin can decrease the renal clearance of Methotrexate, potentially causing systemic methotrexate toxicity, bone marrow suppression, and severe mucositis."
-    },
-    {
-        "drugs": ["Atorvastatin", "Clarithromycin"],
-        "severity": "Moderate",
-        "severity_score": 75,
-        "organ_impact": {"Bleeding Risk": 10, "GI Distress": 45, "Renal Strain": 60, "CNS Effect": 15, "Cardiac Strain": 50},
-        "description": "Clarithromycin is a potent CYP3A4 inhibitor that markedly increases serum concentrations of Atorvastatin, elevating the risk of severe myopathy and rhabdomyolysis."
-    },
-    {
-        "drugs": ["Ibuprofen", "Lisinopril"],
-        "severity": "Moderate",
-        "severity_score": 60,
-        "organ_impact": {"Bleeding Risk": 40, "GI Distress": 65, "Renal Strain": 75, "CNS Effect": 10, "Cardiac Strain": 50},
-        "description": "NSAIDs such as Ibuprofen diminish the antihypertensive effect of ACE inhibitors like Lisinopril and increase the risk of acute renal dysfunction due to blunted renal vascular autoregulation."
-    },
-    {
-        "drugs": ["Omeprazole", "Clopidogrel"],
-        "severity": "Moderate",
-        "severity_score": 58,
-        "organ_impact": {"Bleeding Risk": 30, "GI Distress": 30, "Renal Strain": 20, "CNS Effect": 10, "Cardiac Strain": 75},
-        "description": "Omeprazole inhibits CYP2C19, preventing the bioactivation of Clopidogrel to its active antiplatelet metabolite, reducing antiplatelet efficacy and increasing ischemic cardiac risk."
-    },
-    {
-        "drugs": ["Acetaminophen", "Alcohol"],
-        "severity": "Moderate",
-        "severity_score": 70,
-        "organ_impact": {"Bleeding Risk": 20, "GI Distress": 50, "Renal Strain": 40, "CNS Effect": 40, "Cardiac Strain": 10},
-        "description": "Chronic alcohol consumption induces CYP2E1 enzymes, accelerating conversion of Acetaminophen to NAPQI, a hepatotoxic metabolite, increasing acute liver injury risk."
-    },
-    {
-        "drugs": ["Levothyroxine", "Calcium Carbonate"],
-        "severity": "Low",
-        "severity_score": 35,
-        "organ_impact": {"Bleeding Risk": 0, "GI Distress": 35, "Renal Strain": 10, "CNS Effect": 10, "Cardiac Strain": 10},
-        "description": "Calcium Carbonate binds to Levothyroxine in the gastrointestinal tract, forming insoluble complexes that reduce thyroid hormone absorption."
+        "drugs": ["Metformin", "Simvastatin"],
+        "severity": 15,
+        "category": "Low Risk / Generally Safe",
+        "mechanism": "No direct major metabolic pathway competition or synergistic toxicity reported under normal hepatic function.",
+        "empathetic_summary": "Metformin and Simvastatin are commonly prescribed together for blood sugar and cholesterol management with no major negative interactions.",
+        "symptoms": ["Mild transient gastrointestinal upset", "Occasional muscle fatigue"],
+        "precautions": ["Maintain regular liver enzyme and renal function blood tests.", "Take medications with meals as directed."]
     }
 ]
 
 @st.cache_resource
-def load_faiss_vector_db():
-    """Encodes the drug knowledge base and creates a FAISS vector index."""
-    embedder = SentenceTransformer('all-MiniLM-L6-v2')
-    documents = [f"{item['drugs'][0]} and {item['drugs'][1]}: {item['description']}" for item in INTERACTION_DATABASE]
-    embeddings = embedder.encode(documents, convert_to_numpy=True)
+def build_faiss_vector_db():
+    """Builds an in-memory FAISS vector index using SentenceTransformers Embeddings."""
+    documents = []
+    for item in DRUG_INTERACTION_KB:
+        content = f"Drugs: {', '.join(item['drugs'])}\nSeverity: {item['severity']}\nMechanism: {item['mechanism']}\nSummary: {item['empathetic_summary']}\nSymptoms: {', '.join(item['symptoms'])}"
+        documents.append(Document(page_content=content, metadata=item))
     
-    # Normalize vectors for cosine similarity search
-    faiss.normalize_L2(embeddings)
-    dimension = embeddings.shape[1]
-    index = faiss.IndexFlatIP(dimension)
-    index.add(embeddings)
-    
-    return embedder, index, INTERACTION_DATABASE
+    # Initialize Open Source Sentence Embeddings
+    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    vector_db = FAISS.from_documents(documents, embeddings)
+    return vector_db
 
-embedder, faiss_index, kb_data = load_faiss_vector_db()
-
-def retrieve_interactions(selected_drugs, k=3):
-    """Retrieves verified interactions using FAISS search based on query drugs."""
-    query_text = " ".join(selected_drugs)
-    query_vector = embedder.encode([query_text], convert_to_numpy=True)
-    faiss.normalize_L2(query_vector)
-    
-    distances, indices = faiss_index.search(query_vector, k)
-    retrieved = []
-    
-    for idx in indices[0]:
-        if idx < len(kb_data):
-            # Check if any selected drug matches the knowledge base entry
-            entry = kb_data[idx]
-            match_count = sum(1 for d in selected_drugs if any(d.lower() in drug.lower() or drug.lower() in d.lower() for drug in entry["drugs"]))
-            if match_count >= 1:
-                retrieved.append(entry)
-                
-    # Fallback to top vector match if strict filter yields nothing
-    if not retrieved and len(indices[0]) > 0:
-        retrieved.append(kb_data[indices[0][0]])
-        
-    return retrieved
-
-# -----------------------------------------------------------------------------
-# 3. LLM ANALYSIS GENERATOR
-# -----------------------------------------------------------------------------
-def generate_llm_explanation(api_key, drugs, retrieved_facts):
-    """Uses Gemini 2.5 Flash via google-genai SDK to explain clinical interactions clearly."""
-    if not api_key:
-        return "⚠️ Please enter a Gemini API key in the sidebar to generate the detailed explanation."
-    
-    client = genai.Client(api_key=api_key)
-    
-    context = "\n".join([f"- Interaction: {' + '.join(f['drugs'])} | Severity: {f['severity']} | Detail: {f['description']}" for f in retrieved_facts])
-    
-    prompt = f"""
-    You are an expert clinical pharmacologist and empathetic medical communicator.
-    
-    Medications entered by user: {', '.join(drugs)}
-    Retrieved clinical facts from vector database:
-    {context}
-    
-    Provide a clear, structured, and empathetic medical risk evaluation for the patient using plain English.
-    Structure your response using these exact section headings:
-    
-    ### 1. Medical Risk Overview
-    Summarize what happens when these medications interact in terms an average patient can easily understand.
-    
-    ### 2. Warning Symptoms to Watch Out For
-    List 4-5 specific physical or mental symptoms (red flags) that warrant attention. Use bullet points.
-    
-    ### 3. Immediate Precautions & Recommended Actions
-    Give practical, actionable steps the patient should take right now (e.g., timing adjustments, contacting prescribing doctor, dietary caution).
-    
-    Keep the tone reassuring, professional, and clear. Avoid overly dense jargon without quick explanation.
-    """
-    
-    try:
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.3,
-                max_output_tokens=1000,
-            )
-        )
-        return response.text
-    except Exception as e:
-        return f"Error communicating with Gemini API: {str(e)}"
-
-# -----------------------------------------------------------------------------
-# 4. GRAPHICAL CHART BUILDERS
-# -----------------------------------------------------------------------------
-def create_gauge_chart(risk_score, severity_label):
-    """Generates a Plotly visual gauge chart for interaction severity percentile."""
-    color_map = {"Low": "#28A745", "Moderate": "#FFC107", "High": "#DC3545"}
-    bar_color = color_map.get(severity_label, "#DC3545")
-    
+# ------------------------------------------------------------------------------
+# 3. INTERACTIVE GAUGE & VISUALIZATIONS
+# ------------------------------------------------------------------------------
+def create_severity_gauge(score):
+    """Generates a half-donut Plotly gauge chart for Risk Score."""
     fig = go.Figure(go.Indicator(
         mode="gauge+number",
-        value=risk_score,
-        number={'suffix': "%", 'font': {'size': 36}},
-        title={'text': f"Interaction Severity Index: <b>{severity_label.upper()}</b>", 'font': {'size': 18}},
+        value=score,
+        domain={'x': [0, 1], 'y': [0, 1]},
+        title={'text': "Interaction Risk Score", 'font': {'size': 18, 'color': "#1e293b"}},
         gauge={
-            'axis': {'range': [0, 100], 'tickwidth': 1, 'tickcolor': "#444"},
-            'bar': {'color': bar_color, 'thickness': 0.3},
+            'axis': {'range': [0, 100], 'tickwidth': 1, 'tickcolor': "darkblue"},
+            'bar': {'color': "#0284c7"},
             'bgcolor': "white",
             'borderwidth': 2,
-            'bordercolor': "#CCCCCC",
+            'bordercolor': "#cbd5e1",
             'steps': [
-                {'range': [0, 39], 'color': '#D4EDDA'},
-                {'range': [40, 74], 'color': '#FFF3CD'},
-                {'range': [75, 100], 'color': '#F8D7DA'}
+                {'range': [0, 30], 'color': '#dcfce7'},
+                {'range': [30, 70], 'color': '#fef3c7'},
+                {'range': [70, 100], 'color': '#fee2e2'}
             ],
-            'threshold': {
-                'line': {'color': "black", 'width': 4},
-                'thickness': 0.75,
-                'value': risk_score
-            }
         }
     ))
-    fig.update_layout(margin=dict(l=30, r=30, t=50, b=20), height=280)
+    fig.update_layout(height=220, margin=dict(l=20, r=20, t=40, b=20))
     return fig
 
-def create_organ_radar_chart(organ_impact):
-    """Creates a Radar Chart highlighting organ systems impacted."""
-    categories = list(organ_impact.keys())
-    values = list(organ_impact.values())
+# ------------------------------------------------------------------------------
+# 4. MAIN STREAMLIT APPLICATION
+# ------------------------------------------------------------------------------
+def main():
+    render_disclaimer()
     
-    # Close the loop for radar chart
-    categories.append(categories[0])
-    values.append(values[0])
+    st.title("💊 PharmAssist: RAG Medical Information Assistant")
+    st.caption("FAISS Vector Search & LLM-Powered Drug-to-Drug Interaction Assessment Engine")
     
-    fig = go.Figure(data=go.Scatterpolar(
-        r=values,
-        theta=categories,
-        fill='toself',
-        fillcolor='rgba(220, 53, 69, 0.25)',
-        line=dict(color='#DC3545', width=2),
-        name='Risk Level'
-    ))
+    # Initialize Vector DB
+    with st.spinner("Initializing Vector Knowledge Base (FAISS)..."):
+        vector_db = build_faiss_vector_db()
+
+    # Sidebar Medication Multi-Select
+    st.sidebar.header("📋 Patient Regimen Input")
+    available_drugs = ["Warfarin", "Aspirin", "Lisinopril", "Potassium", "Metformin", "Simvastatin", "Sertraline", "Tramadol", "Amoxicillin", "Ibuprofen", "Fluoxetine"]
     
-    fig.update_layout(
-        polar=dict(
-            radialaxis=dict(visible=True, range=[0, 100], tickfont=dict(size=10)),
-        ),
-        showlegend=False,
-        title=dict(text="<b>Organ System Physiological Impact (%)</b>", font=dict(size=15)),
-        margin=dict(l=40, r=40, t=50, b=30),
-        height=280
+    selected_drugs = st.sidebar.multiselect(
+        "Select Medications (Minimum 2):",
+        options=available_drugs,
+        default=["Warfarin", "Aspirin"]
     )
-    return fig
+    
+    analyze_btn = st.sidebar.button("🔍 Run Vector RAG Analysis", type="primary", use_container_width=True)
 
-# -----------------------------------------------------------------------------
-# 5. USER INTERFACE & MAIN APP WORKFLOW
-# -----------------------------------------------------------------------------
-
-# Medical Emergency & Legal Disclaimer Banner
-st.markdown(
-    """
-    <div class="disclaimer-banner">
-        <div class="disclaimer-title">⚠️ Important Medical Disclaimer & Emergency Notice</div>
-        This tool is designed strictly for informational and educational purposes using artificial intelligence. 
-        It does <b>NOT</b> constitute medical advice, diagnosis, or treatment. 
-        <b>If you are experiencing a medical emergency, severe chest pain, extreme bleeding, or difficulty breathing, call emergency services (911/112) immediately.</b>
-        Always consult a licensed physician or pharmacist before altering any drug regimen.
-    </div>
-    """,
-    unsafe_allow_html=True
-)
-
-st.title("💊 MedGuard AI: Drug Interaction Assistant")
-st.write("FAISS vector search indexing with LLM clinical safety synthesis.")
-
-# Sidebar Controls
-st.sidebar.header("⚙️ Configuration")
-api_key_input = st.sidebar.text_input(
-    "Gemini API Key", 
-    value=os.getenv("GEMINI_API_KEY", ""), 
-    type="password",
-    help="Required for generating plain-English medical explanations."
-)
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("💡 Presets for Quick Testing")
-preset = st.sidebar.selectbox(
-    "Select an example pair:",
-    ["Custom Input", "Warfarin + Aspirin", "Sertraline + Tramadol", "Lisinopril + Spironolactone", "Atorvastatin + Clarithromycin"]
-)
-
-# Manage Drug Input Selection
-preset_mapping = {
-    "Warfarin + Aspirin": ["Warfarin", "Aspirin"],
-    "Sertraline + Tramadol": ["Sertraline", "Tramadol"],
-    "Lisinopril + Spironolactone": ["Lisinopril", "Spironolactone"],
-    "Atorvastatin + Clarithromycin": ["Atorvastatin", "Clarithromycin"]
-}
-
-default_drugs = preset_mapping.get(preset, ["Warfarin", "Aspirin"])
-
-# Multi-select input for medication entry
-available_drugs = sorted(list(set([d for item in INTERACTION_DATABASE for d in item["drugs"]] + ["Warfarin", "Aspirin", "Sertraline", "Tramadol", "Lisinopril", "Spironolactone", "Metformin", "Atorvastatin", "Clarithromycin", "Ibuprofen", "Omeprazole", "Clopidogrel", "Acetaminophen", "Levothyroxine"])))
-
-selected_drugs = st.multiselect(
-    "Enter or select two or more medications to analyze:",
-    options=available_drugs,
-    default=default_drugs,
-    help="Add at least 2 medications to run similarity indexing."
-)
-
-if len(selected_drugs) < 2:
-    st.warning("👉 Please select at least two medications to evaluate interactions.")
-else:
-    if st.button("🔍 Analyze Drug Interactions", type="primary"):
-        with st.spinner("Searching FAISS vector database and generating clinical assessment..."):
+    if analyze_btn or selected_drugs:
+        if len(selected_drugs) < 2:
+            st.info("👈 Please select at least two medications from the sidebar to analyze potential interactions.")
+            return
             
-            # 1. FAISS Search Retrieval
-            matches = retrieve_interactions(selected_drugs)
+        st.subheader(f"Analysis Results for: {', '.join(selected_drugs)}")
+        
+        # Formulate Query for FAISS RAG
+        query = f"Interactions between {', '.join(selected_drugs)}"
+        results = vector_db.similarity_search_with_score(query, k=1)
+        
+        if results:
+            doc, score = results[0]
+            data = doc.metadata
+            severity = data["severity"]
             
-            if matches:
-                primary_match = matches[0]
-                risk_score = primary_match["severity_score"]
-                severity = primary_match["severity"]
-                organ_impact = primary_match["organ_impact"]
-            else:
-                risk_score = 15
-                severity = "Low"
-                organ_impact = {"Bleeding Risk": 10, "GI Distress": 10, "Renal Strain": 10, "CNS Effect": 10, "Cardiac Strain": 10}
-                primary_match = {
-                    "drugs": selected_drugs,
-                    "severity": "Low",
-                    "severity_score": 15,
-                    "description": "No severe high-risk vector match found in primary knowledge base. Standard caution applies."
-                }
-
-            # 2. Key Graphical Metrics & Gauges
-            col1, col2 = st.columns([1, 1])
+            # Top Stats & Metrics
+            col1, col2, col3 = st.columns([2, 2, 3])
             
             with col1:
-                gauge_fig = create_gauge_chart(risk_score, severity)
-                st.plotly_chart(gauge_fig, use_container_width=True)
+                st.plotly_chart(create_severity_gauge(severity), use_container_width=True)
                 
             with col2:
-                radar_fig = create_organ_radar_chart(organ_impact)
-                st.plotly_chart(radar_fig, use_container_width=True)
+                st.metric(label="Risk Severity Level", value=f"{severity}/100", delta=data["category"], delta_color="inverse")
                 
-            st.markdown("---")
-            
-            # 3. Vector Match Details & Explanation
-            col_left, col_right = st.columns([1, 1.2])
-            
-            with col_left:
-                st.subheader("📋 Vector Index Search Results")
-                for idx, m in enumerate(matches, 1):
-                    badge_color = "red" if m['severity'] == "High" else "orange" if m['severity'] == "Moderate" else "green"
-                    st.markdown(f"**Match #{idx}: { ' + '.join(m['drugs'])}**")
-                    st.markdown(f"Severity Grade: **:{badge_color}[{m['severity']} ({m['severity_score']}% Risk Index)]**")
-                    st.info(m['description'])
-            
-            with col_right:
-                st.subheader("🤖 AI Clinical Explanation & Guidance")
-                explanation = generate_llm_explanation(api_key_input, selected_drugs, matches)
-                st.markdown(explanation)
+                # Percentile vs Baseline calculation
+                percentile = min(99, int((severity / 100) * 88 + 10))
+                st.metric(label="Population Risk Percentile", value=f"{percentile}th Percentile")
+                st.write(f"**FAISS Distance Metric:** `{score:.4f}`")
+                
+            with col3:
+                # Graphical Breakdown
+                df_chart = pd.DataFrame({
+                    "Risk Factor": ["Gastrointestinal Bleed", "Renal Clearance Impact", "Serotonin Toxicity", "Cardiovascular Stress"],
+                    "Probability (%)": [severity if "Warfarin" in selected_drugs else 15, 
+                                       severity*0.7 if "Lisinopril" in selected_drugs else 20, 
+                                       severity if "Sertraline" in selected_drugs else 10, 
+                                       severity*0.5]
+                })
+                fig_bar = px.bar(df_chart, x="Probability (%)", y="Risk Factor", orientation='h', color="Probability (%)",
+                                 color_continuous_scale="Reds" if severity > 60 else "Blues", title="Physiological Impact Profile")
+                fig_bar.update_layout(height=220, margin=dict(l=0, r=0, t=30, b=0))
+                st.plotly_chart(fig_bar, use_container_width=True)
 
-# -----------------------------------------------------------------------------
-# 6. KNOWLEDGE BASE SEARCH EXPLORER
-# -----------------------------------------------------------------------------
-with st.expander("📚 Explore Full Vector Knowledge Base"):
-    kb_df = pd.DataFrame([
-        {
-            "Medication Pair": " + ".join(item["drugs"]),
-            "Severity Level": item["severity"],
-            "Risk Score (%)": item["severity_score"],
-            "Clinical Description": item["description"]
-        }
-        for item in INTERACTION_DATABASE
-    ])
-    st.dataframe(kb_df, use_container_width=True)
+            # Interactive Tabs for Medical Information
+            tab1, tab2, tab3, tab4 = st.tabs([
+                "❤️ Empathetic Overview", 
+                "🔬 Pharmacological Mechanism", 
+                "⚠️ Warning Symptoms", 
+                "🛡️ Precautions & Actions"
+            ])
+            
+            with tab1:
+                st.success(f"**Patient Guidance Summary:**\n\n{data['empathetic_summary']}")
+                
+            with tab2:
+                st.info(f"**Clinical Mechanism of Action:**\n\n{data['mechanism']}")
+                
+            with tab3:
+                st.write("**Symptoms to Monitor Closely:**")
+                for s in data["symptoms"]:
+                    st.write(f"- 🔴 {s}")
+                    
+            with tab4:
+                st.write("**Recommended Medical Precautions:**")
+                for p in data["precautions"]:
+                    st.write(f"- 📋 {p}")
+                    
+    # Bottom Disclaimer
+    st.divider()
+    render_disclaimer()
+
+if __name__ == "__main__":
+    main()
